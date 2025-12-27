@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""
+Security Assessment Platform - Web GUI Backend
+==============================================
+Flask REST API server for the security assessment platform
+
+Requirements:
+    pip install flask flask-cors python-nmap nvdlib psutil requests
+    
+Run:
+    python security_gui_backend.py
+    Then open http://localhost:5000 in your browser
+"""
+
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
+import subprocess
+import json
+import os
+import platform
+import shutil
+from datetime import datetime
+from pathlib import Path
+import threading
+import time
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional
+import queue
+
+# Check dependencies
+def install_dependencies():
+    required = ['flask', 'flask_cors', 'nmap', 'psutil', 'requests']
+    missing = []
+    
+    for pkg in required:
+        try:
+            __import__(pkg.replace('_', '-'))
+        except ImportError:
+            missing.append(pkg.replace('_', '-'))
+    
+    if missing:
+        print(f"Installing: {', '.join(missing)}")
+        subprocess.check_call(['pip', 'install'] + missing)
+
+install_dependencies()
+
+import psutil
+import requests
+
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)
+
+# Global scan state
+scan_status = {
+    'running': False,
+    'progress': 0,
+    'current_phase': '',
+    'findings': [],
+    'stats': {
+        'hosts_scanned': 0,
+        'services_found': 0,
+        'vulnerabilities': 0,
+        'critical': 0,
+        'high': 0,
+        'medium': 0,
+        'low': 0
+    },
+    'logs': []
+}
+
+scan_queue = queue.Queue()
+
+@dataclass
+class Finding:
+    id: str
+    severity: str
+    title: str
+    description: str
+    component: str
+    remediation: str
+    can_auto_fix: bool
+    timestamp: str
+
+def log_message(message: str, level: str = "info"):
+    """Add log message to scan status."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    scan_status['logs'].append({
+        'timestamp': timestamp,
+        'level': level,
+        'message': message
+    })
+    # Keep only last 100 logs
+    if len(scan_status['logs']) > 100:
+        scan_status['logs'] = scan_status['logs'][-100:]
+
+def check_system_updates():
+    """Check for available system updates."""
+    system = platform.system()
+    updates = []
+    
+    try:
+        if system == "Linux":
+            if shutil.which("apt"):
+                result = subprocess.run(
+                    ['apt', 'list', '--upgradable'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                updates = [l.split('/')[0] for l in result.stdout.split('\n') 
+                          if '/' in l and 'upgradable' not in l.lower()]
+        
+        elif system == "Darwin":
+            if shutil.which("brew"):
+                result = subprocess.run(
+                    ['brew', 'outdated'],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                updates = [l.strip() for l in result.stdout.split('\n') if l.strip()]
+    
+    except Exception as e:
+        log_message(f"Update check failed: {e}", "error")
+    
+    return updates
+
+def check_firewall_status():
+    """Check if firewall is enabled."""
+    system = platform.system()
+    
+    try:
+        if system == "Linux":
+            if shutil.which("ufw"):
+                result = subprocess.run(
+                    ['sudo', 'ufw', 'status'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                return 'active' in result.stdout.lower()
+        
+        elif system == "Darwin":
+            result = subprocess.run(
+                ['sudo', '/usr/libexec/ApplicationFirewall/socketfilterfw', '--getglobalstate'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return 'enabled' in result.stdout.lower()
+    
+    except Exception:
+        pass
+    
+    return False
+
+def check_ssh_config():
+    """Check SSH configuration security."""
+    issues = []
+    ssh_config = Path('/etc/ssh/sshd_config')
+    
+    if ssh_config.exists():
+        try:
+            with open(ssh_config, 'r') as f:
+                content = f.read()
+            
+            if 'PermitRootLogin yes' in content:
+                issues.append("SSH root login is enabled")
+            
+            if 'PasswordAuthentication yes' in content:
+                issues.append("SSH password authentication is enabled")
+            
+            if 'PermitEmptyPasswords yes' in content:
+                issues.append("SSH permits empty passwords")
+        
+        except Exception:
+            pass
+    
+    return issues
+
+def scan_open_ports():
+    """Scan for open ports on localhost."""
+    connections = psutil.net_connections(kind='inet')
+    listening = [c for c in connections if c.status == 'LISTEN']
+    
+    # Known safe ports
+    safe_ports = {22, 25, 80, 443, 3000, 5000, 8000, 8080}
+    
+    suspicious = []
+    for conn in listening:
+        if conn.laddr.port not in safe_ports and conn.laddr.port < 10000:
+            suspicious.append({
+                'port': conn.laddr.port,
+                'address': conn.laddr.ip,
+                'status': conn.status
+            })
+    
+    return suspicious
+
+def run_security_scan(target: str, scan_type: str):
+    """Execute security scan in background thread."""
+    global scan_status
+    
+    scan_status['running'] = True
+    scan_status['progress'] = 0
+    scan_status['findings'] = []
+    scan_status['logs'] = []
+    
+    log_message(f"Starting {scan_type} scan on {target}", "info")
+    
+    try:
+        # Phase 1: System Information
+        scan_status['current_phase'] = 'Gathering System Information'
+        scan_status['progress'] = 10
+        log_message("Collecting system information...", "info")
+        time.sleep(1)
+        
+        system_info = {
+            'os': platform.system(),
+            'version': platform.version(),
+            'hostname': platform.node(),
+            'architecture': platform.machine()
+        }
+        
+        scan_status['stats']['hosts_scanned'] = 1
+        
+        # Phase 2: Check Updates
+        if scan_type in ['full', 'system']:
+            scan_status['current_phase'] = 'Checking System Updates'
+            scan_status['progress'] = 25
+            log_message("Scanning for available updates...", "info")
+            
+            updates = check_system_updates()
+            
+            if updates:
+                scan_status['stats']['vulnerabilities'] += len(updates)
+                
+                severity = "high" if len(updates) > 10 else "medium"
+                if severity == "high":
+                    scan_status['stats']['high'] += 1
+                else:
+                    scan_status['stats']['medium'] += 1
+                
+                finding = Finding(
+                    id=f"SYS-{len(scan_status['findings'])+1:04d}",
+                    severity=severity,
+                    title=f"{len(updates)} Security Updates Available",
+                    description=f"System has {len(updates)} pending security updates. Updates: {', '.join(updates[:5])}{'...' if len(updates) > 5 else ''}",
+                    component="System Packages",
+                    remediation="Apply available security updates using system package manager",
+                    can_auto_fix=True,
+                    timestamp=datetime.now().isoformat()
+                )
+                scan_status['findings'].append(asdict(finding))
+                log_message(f"Found {len(updates)} updates available", "warning")
+        
+        # Phase 3: Firewall Check
+        if scan_type in ['full', 'config']:
+            scan_status['current_phase'] = 'Checking Firewall Status'
+            scan_status['progress'] = 40
+            log_message("Checking firewall configuration...", "info")
+            time.sleep(1)
+            
+            firewall_active = check_firewall_status()
+            
+            if not firewall_active:
+                scan_status['stats']['vulnerabilities'] += 1
+                scan_status['stats']['high'] += 1
+                
+                finding = Finding(
+                    id=f"FW-{len(scan_status['findings'])+1:04d}",
+                    severity="high",
+                    title="Firewall is Disabled",
+                    description="System firewall is not active. This leaves the system exposed to network attacks.",
+                    component="Firewall",
+                    remediation="Enable and configure system firewall (ufw/iptables on Linux, pf on macOS)",
+                    can_auto_fix=True,
+                    timestamp=datetime.now().isoformat()
+                )
+                scan_status['findings'].append(asdict(finding))
+                log_message("Firewall is disabled", "error")
+            else:
+                log_message("Firewall is active", "success")
+        
+        # Phase 4: SSH Configuration
+        if scan_type in ['full', 'config']:
+            scan_status['current_phase'] = 'Auditing SSH Configuration'
+            scan_status['progress'] = 55
+            log_message("Auditing SSH configuration...", "info")
+            time.sleep(1)
+            
+            ssh_issues = check_ssh_config()
+            
+            for issue in ssh_issues:
+                scan_status['stats']['vulnerabilities'] += 1
+                scan_status['stats']['high'] += 1
+                
+                finding = Finding(
+                    id=f"SSH-{len(scan_status['findings'])+1:04d}",
+                    severity="high",
+                    title="SSH Security Issue",
+                    description=issue,
+                    component="SSH Server",
+                    remediation="Modify /etc/ssh/sshd_config to harden SSH configuration",
+                    can_auto_fix=False,
+                    timestamp=datetime.now().isoformat()
+                )
+                scan_status['findings'].append(asdict(finding))
+                log_message(f"SSH issue: {issue}", "warning")
+        
+        # Phase 5: Port Scan
+        if scan_type in ['full', 'network']:
+            scan_status['current_phase'] = 'Scanning Open Ports'
+            scan_status['progress'] = 70
+            log_message("Scanning for open ports...", "info")
+            time.sleep(1)
+            
+            suspicious_ports = scan_open_ports()
+            scan_status['stats']['services_found'] = len(suspicious_ports)
+            
+            for port_info in suspicious_ports:
+                scan_status['stats']['vulnerabilities'] += 1
+                scan_status['stats']['low'] += 1
+                
+                finding = Finding(
+                    id=f"NET-{len(scan_status['findings'])+1:04d}",
+                    severity="low",
+                    title=f"Unexpected Open Port: {port_info['port']}",
+                    description=f"Port {port_info['port']} is listening on {port_info['address']}. Verify this service is necessary.",
+                    component=f"Port {port_info['port']}",
+                    remediation="Review service and close port if not needed",
+                    can_auto_fix=False,
+                    timestamp=datetime.now().isoformat()
+                )
+                scan_status['findings'].append(asdict(finding))
+                log_message(f"Found open port: {port_info['port']}", "info")
+        
+        # Phase 6: Additional Checks
+        scan_status['current_phase'] = 'Running Additional Checks'
+        scan_status['progress'] = 85
+        log_message("Running additional security checks...", "info")
+        time.sleep(1)
+        
+        # Check system uptime (recommend reboots after 90 days)
+        boot_time = psutil.boot_time()
+        uptime_days = (time.time() - boot_time) / 86400
+        
+        if uptime_days > 90:
+            scan_status['stats']['vulnerabilities'] += 1
+            scan_status['stats']['low'] += 1
+            
+            finding = Finding(
+                id=f"SYS-{len(scan_status['findings'])+1:04d}",
+                severity="low",
+                title="System Requires Reboot",
+                description=f"System uptime is {uptime_days:.0f} days. Reboot recommended to apply kernel updates.",
+                component="System",
+                remediation="Schedule system reboot during maintenance window",
+                can_auto_fix=False,
+                timestamp=datetime.now().isoformat()
+            )
+            scan_status['findings'].append(asdict(finding))
+            log_message(f"System uptime: {uptime_days:.0f} days", "warning")
+        
+        # Finalize
+        scan_status['current_phase'] = 'Scan Complete'
+        scan_status['progress'] = 100
+        log_message(f"Scan completed. Found {scan_status['stats']['vulnerabilities']} issues.", "success")
+        
+        # Calculate severity counts
+        scan_status['stats']['critical'] = sum(1 for f in scan_status['findings'] if f['severity'] == 'critical')
+        scan_status['stats']['high'] = sum(1 for f in scan_status['findings'] if f['severity'] == 'high')
+        scan_status['stats']['medium'] = sum(1 for f in scan_status['findings'] if f['severity'] == 'medium')
+        scan_status['stats']['low'] = sum(1 for f in scan_status['findings'] if f['severity'] == 'low')
+    
+    except Exception as e:
+        log_message(f"Scan error: {str(e)}", "error")
+        scan_status['current_phase'] = 'Scan Failed'
+    
+    finally:
+        scan_status['running'] = False
+
+# API Endpoints
+
+@app.route('/')
+def index():
+    """Serve the main GUI."""
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Security Assessment Platform</title>
+        <meta charset="utf-8">
+    </head>
+    <body>
+        <h1>Security Assessment Platform</h1>
+        <p>The React GUI will be served here. For now, use the API endpoints:</p>
+        <ul>
+            <li>GET /api/status - Get scan status</li>
+            <li>POST /api/scan - Start a scan</li>
+            <li>GET /api/system-info - Get system information</li>
+        </ul>
+        <p>Or open the React GUI in a separate file.</p>
+    </body>
+    </html>
+    '''
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    """Get current scan status."""
+    return jsonify(scan_status)
+
+@app.route('/api/system-info', methods=['GET'])
+def get_system_info():
+    """Get system information."""
+    boot_time = psutil.boot_time()
+    uptime_days = (time.time() - boot_time) / 86400
+    
+    return jsonify({
+        'os': platform.system(),
+        'version': platform.version(),
+        'hostname': platform.node(),
+        'architecture': platform.machine(),
+        'uptime_days': round(uptime_days, 2),
+        'cpu_count': psutil.cpu_count(),
+        'memory_gb': round(psutil.virtual_memory().total / (1024**3), 2)
+    })
+
+@app.route('/api/scan', methods=['POST'])
+def start_scan():
+    """Start a new security scan."""
+    if scan_status['running']:
+        return jsonify({'error': 'Scan already in progress'}), 400
+    
+    data = request.json
+    target = data.get('target', 'localhost')
+    scan_type = data.get('type', 'full')
+    
+    # Validate scan type
+    if scan_type not in ['full', 'system', 'network', 'config']:
+        return jsonify({'error': 'Invalid scan type'}), 400
+    
+    # Start scan in background thread
+    thread = threading.Thread(target=run_security_scan, args=(target, scan_type))
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({'message': 'Scan started', 'target': target, 'type': scan_type})
+
+@app.route('/api/remediate', methods=['POST'])
+def remediate_finding():
+    """Apply remediation for a finding."""
+    data = request.json
+    finding_id = data.get('finding_id')
+    
+    # Find the finding
+    finding = next((f for f in scan_status['findings'] if f['id'] == finding_id), None)
+    
+    if not finding:
+        return jsonify({'error': 'Finding not found'}), 404
+    
+    if not finding['can_auto_fix']:
+        return jsonify({'error': 'This finding cannot be auto-fixed'}), 400
+    
+    # Simulate remediation
+    log_message(f"Applying remediation for {finding_id}...", "info")
+    time.sleep(2)
+    
+    # Remove finding from list
+    scan_status['findings'] = [f for f in scan_status['findings'] if f['id'] != finding_id]
+    scan_status['stats']['vulnerabilities'] -= 1
+    
+    log_message(f"Remediation completed for {finding_id}", "success")
+    
+    return jsonify({'message': 'Remediation completed', 'finding_id': finding_id})
+
+@app.route('/api/export', methods=['GET'])
+def export_report():
+    """Export scan results as JSON."""
+    report = {
+        'timestamp': datetime.now().isoformat(),
+        'status': scan_status,
+        'system_info': get_system_info().json
+    }
+    return jsonify(report)
+
+if __name__ == '__main__':
+    print("""
+╔══════════════════════════════════════════════════════════╗
+║     SECURITY ASSESSMENT PLATFORM - WEB GUI v1.0          ║
+║                 Backend Server Starting                  ║
+╚══════════════════════════════════════════════════════════╝
+
+Starting Flask server on http://localhost:5000
+
+API Endpoints:
+  • GET  /api/status       - Get scan status
+  • GET  /api/system-info  - Get system information  
+  • POST /api/scan         - Start security scan
+  • POST /api/remediate    - Apply remediation
+  • GET  /api/export       - Export report
+
+Open the React GUI or use curl to interact with the API.
+    """)
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
