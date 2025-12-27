@@ -1,0 +1,2 @@
+use: wsl --install 
+to run linux commands for installation 
